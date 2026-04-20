@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "image-search": {
+      "command": "bun",
+      "args": ["run", "/absolute/path/to/image-search-mcp/src/index.ts"]
+    }
+  }
+}
