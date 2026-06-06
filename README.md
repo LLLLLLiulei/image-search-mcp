@@ -1,23 +1,27 @@
 # Image Search MCP
 
-基于 Bing 图片搜索的 MCP Server，支持关键词搜索图片并下载到本地。适用于 Claude Desktop、Cursor 等 MCP 客户端。
+一个基于 Model Context Protocol (MCP) 的图片搜索与下载服务。当前版本提供统一工具 `image_search`，可从 Pexels、Pixabay、Unsplash 和 Bing 搜索图片；配置了 API Key 的 provider 会参与搜索，未配置的 provider 会自动跳过，Bing 作为无需 API Key 的兜底来源。
+
+适用于 Claude Desktop、Cursor 等支持 MCP stdio 的客户端。
 
 ## 功能特性
 
-- 根据关键词从 Bing 搜索图片，返回结构化结果（URL、缩略图、尺寸、来源页面）
-- 自动下载图片到本地目录，按分辨率降序排列
-- 图片过滤：跳过 SVG、过小图片（宽或高 < 200px）
-- URL 去重，避免重复下载
-- 并发下载，支持错误重试
-- 零成本，无需 API Key
+- 单一 MCP 工具 `image_search`：通过 `save_dir` 参数区分“只搜索”和“搜索并下载”两种模式
+- 多图片源并发搜索：Pexels、Pixabay、Unsplash、Bing
+- 缺少 API Key 时自动跳过对应 provider，并在 `diagnostics` 中返回状态
+- 统一结果格式：provider、标题/描述、下载 URL、尺寸、来源页面
+- 结果排序：URL/来源去重、orientation 过滤、相关性评分、provider 优先级、分辨率加权
+- 本地下载：自动创建目录，跳过过小图片，单张失败不影响后续候选
+- 轻量尺寸检测：从文件头解析 JPEG、PNG、GIF、WebP 尺寸
 
 ## 技术栈
 
 - **运行时**: Bun
 - **语言**: TypeScript
 - **协议**: Model Context Protocol (MCP)，stdio 传输
-- **HTML 解析**: cheerio
-- **尺寸检测**: 从文件头字节解析（支持 JPEG、PNG、GIF、WebP）
+- **MCP SDK**: `@modelcontextprotocol/sdk`
+- **HTML 解析**: `cheerio`，用于 Bing 图片页面解析
+- **测试**: Bun 内置 `bun:test`
 
 ## 快速开始
 
@@ -28,15 +32,33 @@ cd image-search-mcp
 bun install
 ```
 
-### 2. 启动服务
+### 2. 可选：配置图片源 API Key
+
+Pexels、Pixabay、Unsplash 是可选增强来源；不配置时仍可使用 Bing 兜底。
+
+```bash
+export PEXELS_API_KEY="your-pexels-key"
+export PIXABAY_API_KEY="your-pixabay-key"
+export UNSPLASH_ACCESS_KEY="your-unsplash-access-key"
+```
+
+> 不要把真实 API Key 写入仓库文件或提交到 Git。建议通过 MCP 客户端的 `env` 配置或本机 shell 环境变量注入。
+
+### 3. 启动服务
 
 ```bash
 bun start
 ```
 
-### 3. 配置 MCP 客户端
+开发模式可使用：
 
-将以下配置添加到你的 MCP 客户端配置文件中：
+```bash
+bun dev
+```
+
+### 4. 配置 MCP 客户端
+
+将以下配置添加到 MCP 客户端配置文件中，并把路径替换为本机绝对路径。
 
 **Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`)：
 
@@ -45,7 +67,12 @@ bun start
   "mcpServers": {
     "image-search": {
       "command": "bun",
-      "args": ["run", "/absolute/path/to/image-search-mcp/src/index.ts"]
+      "args": ["run", "/absolute/path/to/image-search-mcp/src/index.ts"],
+      "env": {
+        "PEXELS_API_KEY": "your-pexels-key",
+        "PIXABAY_API_KEY": "your-pixabay-key",
+        "UNSPLASH_ACCESS_KEY": "your-unsplash-access-key"
+      }
     }
   }
 }
@@ -58,140 +85,221 @@ bun start
   "mcpServers": {
     "image-search": {
       "command": "bun",
-      "args": ["run", "/absolute/path/to/image-search-mcp/src/index.ts"]
+      "args": ["run", "/absolute/path/to/image-search-mcp/src/index.ts"],
+      "env": {
+        "PEXELS_API_KEY": "your-pexels-key",
+        "PIXABAY_API_KEY": "your-pixabay-key",
+        "UNSPLASH_ACCESS_KEY": "your-unsplash-access-key"
+      }
     }
   }
 }
 ```
 
-> 将 `/absolute/path/to/image-search-mcp` 替换为项目的实际绝对路径。
+如果只想使用 Bing 兜底，可以删除 `env` 字段。
 
 ## 工具说明
 
-### search_images
+### image_search
 
-根据关键词搜索 Bing 图片，返回图片列表及元数据。
+统一图片搜索工具。传入 `save_dir` 时会下载图片；不传 `save_dir` 时只返回 URL 和元数据。
 
 **参数**：
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| keyword | string | 是 | - | 搜索关键词 |
-| count | number | 否 | 5 | 返回结果数量 |
+| `query` | string | 是 | - | 搜索关键词 |
+| `count` | number | 否 | 5 | 期望返回或下载的图片数量，范围 1-20 |
+| `save_dir` | string | 否 | - | 保存目录；传入后启用下载模式 |
+| `orientation` | string | 否 | - | 图片方向：`landscape`、`portrait`、`squarish` |
 
-**返回值** (`structuredContent`)：
+### 只搜索模式
+
+不传 `save_dir` 时，工具返回文本摘要和 `structuredContent.results`。
+
+示例调用参数：
 
 ```json
 {
-  "images": [
-    {
-      "url": "https://example.com/image.jpg",
-      "thumbnailUrl": "https://ts.mm.bing.net/th?id=...",
-      "width": 1920,
-      "height": 1080,
-      "sourcePage": "https://example.com/page"
-    }
-  ],
-  "total": 5
+  "query": "mountain lake sunrise",
+  "count": 3,
+  "orientation": "landscape"
 }
 ```
 
-| 字段 | 说明 |
-|------|------|
-| url | 原图 URL |
-| thumbnailUrl | Bing 缩略图 URL |
-| width | 图片宽度（像素），通过文件头解析获取 |
-| height | 图片高度（像素），通过文件头解析获取 |
-| sourcePage | 来源网页 URL |
-| total | 返回结果总数 |
-
-### download_images
-
-根据关键词搜索图片，过滤后下载到本地目录。
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| keyword | string | 是 | - | 搜索关键词 |
-| count | number | 否 | 5 | 下载数量 |
-| save_dir | string | 否 | `"images"` | 保存目录 |
-
-**返回值** (`structuredContent`)：
+示例返回结构：
 
 ```json
 {
+  "results": [
+    {
+      "provider": "pexels",
+      "title": "Mountain lake at sunrise",
+      "description": "Mountain lake at sunrise",
+      "downloadUrl": "https://images.pexels.com/photos/.../original.jpg",
+      "width": 6000,
+      "height": 4000,
+      "sourcePage": "https://www.pexels.com/photo/..."
+    }
+  ],
+  "diagnostics": {
+    "pexels": { "status": "ok", "count": 3 },
+    "pixabay": { "status": "skipped", "count": 0, "error": "PIXABAY_API_KEY not configured" },
+    "unsplash": { "status": "skipped", "count": 0, "error": "Missing UNSPLASH_ACCESS_KEY environment variable" },
+    "bing": { "status": "ok", "count": 2 }
+  }
+}
+```
+
+### 下载模式
+
+传入 `save_dir` 时，工具会先搜索更多候选，再下载排序后的图片。
+
+示例调用参数：
+
+```json
+{
+  "query": "mountain lake sunrise",
+  "count": 3,
+  "save_dir": "images",
+  "orientation": "landscape"
+}
+```
+
+示例返回结构：
+
+```json
+{
+  "directory": "images/mountain_lake_sunrise",
   "downloaded": [
     {
-      "filePath": "/path/to/images/keyword/keyword_1.jpg",
-      "width": 2880,
-      "height": 1800
+      "filePath": "images/mountain_lake_sunrise/mountain_lake_sunrise_pexels_1.jpeg",
+      "provider": "pexels",
+      "width": 6000,
+      "height": 4000
     }
   ],
   "failed": [
     {
-      "filePath": "/path/to/images/keyword/keyword_3.jpg",
-      "error": "timeout"
+      "provider": "bing",
+      "downloadUrl": "https://example.com/broken.jpg",
+      "error": "HTTP 403"
     }
   ],
-  "saveDirectory": "/path/to/images"
+  "results": [
+    {
+      "provider": "pexels",
+      "title": "Mountain lake at sunrise",
+      "description": "Mountain lake at sunrise",
+      "downloadUrl": "https://images.pexels.com/photos/.../original.jpg",
+      "width": 6000,
+      "height": 4000,
+      "sourcePage": "https://www.pexels.com/photo/..."
+    }
+  ],
+  "diagnostics": {
+    "pexels": { "status": "ok", "count": 12 },
+    "pixabay": { "status": "skipped", "count": 0, "error": "PIXABAY_API_KEY not configured" },
+    "unsplash": { "status": "skipped", "count": 0, "error": "Missing UNSPLASH_ACCESS_KEY environment variable" },
+    "bing": { "status": "ok", "count": 6 }
+  }
 }
 ```
 
-| 字段 | 说明 |
-|------|------|
-| downloaded | 成功下载的图片列表，包含本地路径和尺寸 |
-| failed | 下载失败的图片列表，包含错误信息 |
-| saveDirectory | 图片保存的根目录 |
-
 **下载规则**：
 
-- 自动创建子目录：`{save_dir}/{keyword}/`
-- 文件命名：`{keyword}_1.jpg`、`{keyword}_2.jpg`...
-- 按分辨率（宽 x 高）降序排列，优先保存高分辨率图片
-- 过滤掉宽度或高度 < 200px 的图片
-- 跳过 SVG 格式
-- 单张图片下载失败不影响其他图片
+- 自动创建子目录：`{save_dir}/{清洗后的 query}/`
+- 文件命名：`{清洗后的 query}_{provider}_{序号}.{ext}`
+- 下载候选来自统一排序后的搜索结果
+- 图片尺寸低于 200px 时会跳过
+- 非图片响应、HTTP 错误、文件过小等会进入 `failed`
+- 单张图片失败不会中断整体下载流程
+
+## Provider 说明
+
+| Provider | API Key | 环境变量 | 说明 |
+|----------|---------|----------|------|
+| Pexels | 需要 | `PEXELS_API_KEY` | 优先级最高，返回较高质量的摄影图片 |
+| Pixabay | 需要 | `PIXABAY_API_KEY` | 支持 tags、作者、Pixabay license 元数据 |
+| Unsplash | 需要 | `UNSPLASH_ACCESS_KEY` | 使用 Unsplash Search Photos API |
+| Bing | 不需要 | - | 通过 HTML 页面解析获取结果，作为兜底来源 |
+
+Provider 状态会通过 `diagnostics` 返回：
+
+- `ok`：provider 成功返回结果
+- `skipped`：通常是缺少 API Key
+- `error`：请求失败、超时或接口返回错误
 
 ## 项目结构
 
-```
+```text
 image-search-mcp/
 ├── package.json
 ├── tsconfig.json
-├── mcp-config.example.json       # MCP 客户端配置示例
+├── mcp-config.example.json          # MCP 客户端配置示例
 ├── src/
-│   ├── index.ts                  # MCP Server 入口，注册工具
-│   ├── bing-search.ts            # Bing 图片搜索（HTML 爬取 + 解析）
-│   ├── image-downloader.ts       # 图片下载、尺寸检测、过滤排序
-│   └── types.ts                  # 类型定义和常量
-└── openspec/                     # 变更管理文档
+│   ├── index.ts                     # MCP Server 入口，注册 image_search
+│   ├── types.ts                     # 统一类型定义和常量
+│   ├── bing-search.ts               # Bing 图片 HTML 爬取与结果转换
+│   ├── pexels-api.ts                # Pexels provider
+│   ├── pixabay-api.ts               # Pixabay provider
+│   ├── unsplash-api.ts              # Unsplash provider
+│   ├── scoring.ts                   # 去重、orientation 过滤和结果排序
+│   ├── serialization.ts             # MCP structuredContent 序列化
+│   ├── image-downloader.ts          # 图片下载、尺寸检测和保存
+│   └── *.test.ts                    # Bun 测试
+└── openspec/                        # OpenSpec 变更文档（如本地保留）
 ```
 
-## 开发
+## 开发与验证
 
 ```bash
 # 开发模式（文件变更自动重启）
 bun dev
 
-# 手动测试 MCP 握手
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1.0"}}}' | bun start
+# 类型检查
+bunx tsc --noEmit
+
+# 运行测试
+bun test
+```
+
+手动检查 MCP 握手和工具列表：
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1.0"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+  | bun start
+```
+
+手动调用 `image_search`：
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1.0"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"image_search","arguments":{"query":"mountain lake","count":2}}}' \
+  | bun start
 ```
 
 ## 注意事项
 
-- 本项目通过爬取 Bing 图片搜索页面获取结果，不使用官方 API
-- Bing 可能限制请求频率或更改页面结构，如遇搜索失败可稍后重试
-- 搜索结果中的图片尺寸通过 HTTP Range 请求获取文件头解析，少数服务器可能不支持 Range 请求
-- 下载的图片受原网站版权保护，请合理使用
+- Pexels、Pixabay、Unsplash 使用官方 API，需遵守各自服务条款、配额和授权要求。
+- Bing provider 通过页面解析获取结果，页面结构变化或反爬限制可能导致空结果或失败。
+- 当前 MCP 工具仅暴露 `orientation` 作为统一筛选项；其他 provider 特有筛选参数未暴露。
+- 当前仅注册 `image_search`；旧版 `search_images`、`download_images`、`search_unsplash_photos`、`download_unsplash_photos` 不再提供。
+- 下载目录由调用方传入，请避免传入敏感系统目录。
+- 下载的图片版权和使用授权取决于原 provider 和来源页面，请在使用前自行确认。
 
 ## 免责声明
 
 本项目仅供学习和研究使用，使用者需自行承担以下责任：
 
-- **版权**：搜索和下载的图片版权归原作者或网站所有，本项目不拥有任何图片的版权。使用者应遵守相关版权法律法规，不得将下载的图片用于商业用途或侵犯他人知识产权。
-- **使用风险**：本项目通过爬取 Bing 搜索页面获取图片链接，可能违反 Bing 的服务条款。使用者需自行评估并承担由此产生的法律风险，开发者不承担任何责任。
-- **内容合规**：搜索结果的内容和准确性由 Bing 搜索引擎决定，开发者不对搜索结果的真实性、合法性或适用性做任何保证。
-- **无担保**：本项目按"原样"提供，不做任何明示或暗示的担保，包括但不限于适销性和特定用途的适用性。
+- **版权与授权**：搜索和下载的图片版权归原作者或网站所有，本项目不拥有任何图片版权。请遵守 Pexels、Pixabay、Unsplash、Bing 以及原来源网站的授权条款。
+- **使用风险**：Bing provider 使用页面解析方式，可能受页面结构、服务条款或访问限制影响。
+- **内容合规**：搜索结果由第三方 provider 返回，本项目不保证内容的真实性、合法性、适用性或安全性。
+- **无担保**：本项目按“原样”提供，不做任何明示或暗示的担保，包括但不限于适销性和特定用途适用性。
 
 使用本项目即表示你已阅读并同意以上声明。
