@@ -2,134 +2,180 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { searchImages } from "./bing-search.js";
+import { searchImages as bingSearch, toImageResults as bingToResults } from "./bing-search.js";
+import { searchPhotos as pexelsSearch } from "./pexels-api.js";
+import { searchPhotos as pixabaySearch } from "./pixabay-api.js";
+import { searchPhotos as unsplashSearch, toImageResults as unsplashToResults } from "./unsplash-api.js";
 import { downloadImages } from "./image-downloader.js";
 import { DEFAULT_IMAGE_COUNT } from "./types.js";
+import type { DownloadImagesResult, ImageProvider, ImageResult, ProviderDiagnostics } from "./types.js";
+import { rankResults } from "./scoring.js";
+import { serializeDownloadedImage, serializeFailedDownload, serializeImageResult } from "./serialization.js";
 
 const server = new McpServer({
   name: "image-search-mcp",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
-server.registerTool(
-  "search_images",
-  {
-    title: "Search Images",
-    description: "Search images from Bing by keyword. Returns a list of image URLs with metadata (thumbnail, dimensions, source page).",
-    inputSchema: {
-      keyword: z.string().describe("Search keyword for images"),
-      count: z.number().optional().describe("Number of images to return (default: 5)"),
-    },
-    outputSchema: {
-      images: z.array(z.object({
-        url: z.string().describe("Original image URL"),
-        thumbnailUrl: z.string().describe("Thumbnail image URL"),
-        width: z.number().describe("Image width in pixels"),
-        height: z.number().describe("Image height in pixels"),
-        sourcePage: z.string().describe("Source webpage URL"),
-      })).describe("List of search results"),
-      total: z.number().describe("Total number of results returned"),
-    },
-  },
-  async ({ keyword, count }) => {
-    try {
-      const results = await searchImages(keyword, count ?? DEFAULT_IMAGE_COUNT);
-      if (results.length === 0) {
-        return {
-          content: [{ type: "text" as const, text: `No images found for "${keyword}"` }],
-          structuredContent: { images: [], total: 0 },
-        };
-      }
-      const text = results
-        .map(
-          (r, i) =>
-            `${i + 1}. ${r.url}\n   Size: ${r.width}x${r.height} | Source: ${r.sourcePage}`
-        )
-        .join("\n\n");
-      return {
-        content: [{ type: "text" as const, text }],
-        structuredContent: { images: results, total: results.length },
-      };
-    } catch (err) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Search failed: ${err instanceof Error ? err.message : String(err)}`,
-          },
-        ],
-        isError: true,
-      };
+const PROVIDERS: ImageProvider[] = ["pexels", "pixabay", "unsplash", "bing"];
+
+interface SearchAllProvidersResult {
+  results: ImageResult[];
+  diagnostics: ProviderDiagnostics;
+}
+
+function createDiagnostics(): ProviderDiagnostics {
+  return Object.fromEntries(
+    PROVIDERS.map((provider) => [provider, { status: "skipped", count: 0 }])
+  ) as ProviderDiagnostics;
+}
+
+function isMissingConfigError(provider: ImageProvider, err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  if (provider === "pexels") return message.includes("PEXELS_API_KEY");
+  if (provider === "pixabay") return message.includes("PIXABAY_API_KEY");
+  if (provider === "unsplash") return message.includes("UNSPLASH_ACCESS_KEY");
+  return false;
+}
+
+function bingFiltersForOrientation(orientation?: string) {
+  if (orientation === "landscape") return { aspect: "wide" as const };
+  if (orientation === "portrait") return { aspect: "tall" as const };
+  if (orientation === "squarish") return { aspect: "square" as const };
+  return undefined;
+}
+
+function formatSearchResults(results: ImageResult[]): string {
+  return results
+    .map((r, i) => {
+      const label = r.description || r.title || r.tags?.join(", ") || "";
+      const byline = r.author ? ` by ${r.author}` : "";
+      const title = label ? ` - ${label}` : "";
+      return `${i + 1}. [${r.provider}] ${r.width}x${r.height}${byline}${title}\n   ${r.downloadUrl}\n   Source: ${r.sourcePage}`;
+    })
+    .join("\n\n");
+}
+
+function formatDownloadResult(result: DownloadImagesResult): string {
+  const lines: string[] = [];
+  if (result.downloaded.length > 0) {
+    lines.push(`Downloaded ${result.downloaded.length} image(s):`);
+    result.downloaded.forEach((d) => {
+      lines.push(`  ${d.filePath} (${d.width}x${d.height}) [${d.provider}]${d.author ? ` by ${d.author}` : ""}`);
+    });
+  }
+  if (result.failed.length > 0) {
+    lines.push(`\nFailed ${result.failed.length}:`);
+    result.failed.forEach((f) => lines.push(`  ${f.downloadUrl}: ${f.error}`));
+  }
+  return lines.join("\n") || "No images downloaded";
+}
+
+async function searchAllProviders(
+  query: string,
+  count: number,
+  orientation?: string,
+): Promise<SearchAllProvidersResult> {
+  const diagnostics = createDiagnostics();
+  const tasks: Array<Promise<{ provider: ImageProvider; results: ImageResult[] }>> = [
+    pexelsSearch(query, count, orientation)
+      .then((results) => ({ provider: "pexels" as const, results })),
+    pixabaySearch(query, count, orientation)
+      .then((results) => ({ provider: "pixabay" as const, results })),
+    unsplashSearch(query, count, 1, "relevant", undefined, orientation)
+      .then(({ photos }) => ({ provider: "unsplash" as const, results: unsplashToResults(photos) })),
+    bingSearch(query, count * 2, bingFiltersForOrientation(orientation))
+      .then((results) => ({ provider: "bing" as const, results: bingToResults(results) })),
+  ];
+
+  const settled = await Promise.allSettled(tasks);
+  const merged: ImageResult[] = [];
+  for (const result of settled) {
+    if (result.status === "fulfilled") {
+      diagnostics[result.value.provider] = { status: "ok", count: result.value.results.length };
+      merged.push(...result.value.results);
+      continue;
+    }
+
+    const reason = result.reason;
+    const message = reason instanceof Error ? reason.message : String(reason);
+    const provider = PROVIDERS.find((name) => message.toLowerCase().includes(name)) || (
+      message.includes("PEXELS_API_KEY") ? "pexels" :
+      message.includes("PIXABAY_API_KEY") ? "pixabay" :
+      message.includes("UNSPLASH_ACCESS_KEY") ? "unsplash" :
+      "bing"
+    );
+    if (isMissingConfigError(provider, reason)) {
+      diagnostics[provider] = { status: "skipped", count: 0, error: message };
+    } else {
+      diagnostics[provider] = { status: "error", count: 0, error: message };
+      console.error(`${provider}:`, message);
     }
   }
-);
+
+  return {
+    results: rankResults(merged, query, count, orientation),
+    diagnostics,
+  };
+}
 
 server.registerTool(
-  "download_images",
+  "image_search",
   {
-    title: "Download Images",
-    description: "Search images from Bing by keyword, filter by size, and download to local directory. Returns local file paths.",
+    title: "Search and Download Images",
+    description:
+      "Search images from multiple providers (Pexels, Pixabay, Unsplash, Bing) by keyword. " +
+      "When save_dir is provided, images are downloaded to that directory. " +
+      "When save_dir is omitted, returns URLs and metadata only. " +
+      "Providers are tried in priority order; those without API keys are skipped automatically.",
     inputSchema: {
-      keyword: z.string().describe("Search keyword for images"),
-      count: z.number().optional().describe("Number of images to download (default: 5)"),
-      save_dir: z.string().optional().describe("Directory to save images (default: ./images)"),
-    },
-    outputSchema: {
-      downloaded: z.array(z.object({
-        filePath: z.string().describe("Local file path of the saved image"),
-        width: z.number().describe("Image width in pixels"),
-        height: z.number().describe("Image height in pixels"),
-      })).describe("Successfully downloaded images"),
-      failed: z.array(z.object({
-        filePath: z.string().describe("Intended file path"),
-        error: z.string().describe("Error message"),
-      })).describe("Failed downloads"),
-      saveDirectory: z.string().describe("Directory where images were saved"),
+      query: z.string().describe("Search keyword"),
+      count: z.number().int().min(1).max(20).optional().describe("Number of images (default: 5, max: 20)"),
+      save_dir: z.string().optional().describe("Directory to save images. If provided, downloads images; if omitted, returns URLs only"),
+      orientation: z.enum(["landscape", "portrait", "squarish"]).optional().describe("Image orientation filter"),
     },
   },
-  async ({ keyword, count, save_dir }) => {
+  async ({ query, count, save_dir, orientation }) => {
     try {
-      const searchResults = await searchImages(keyword, (count ?? DEFAULT_IMAGE_COUNT) * 2);
-      if (searchResults.length === 0) {
+      const num = count ?? DEFAULT_IMAGE_COUNT;
+      const searchCount = save_dir ? Math.max(num * 4, 12) : num;
+      const { results, diagnostics } = await searchAllProviders(query, searchCount, orientation);
+      const selected = results.slice(0, num);
+
+      if (selected.length === 0) {
         return {
-          content: [{ type: "text" as const, text: `No images found for "${keyword}"` }],
-          structuredContent: { downloaded: [], failed: [], saveDirectory: save_dir ?? "images" },
+          content: [{ type: "text" as const, text: `No images found for "${query}"` }],
+          structuredContent: { results: [], diagnostics },
         };
       }
-      const results = await downloadImages(
-        searchResults,
-        keyword,
-        count ?? DEFAULT_IMAGE_COUNT,
-        save_dir ?? "images"
-      );
-      const succeeded = results.filter((r) => r.success);
-      const failed = results.filter((r) => !r.success);
 
-      const lines: string[] = [];
-      if (succeeded.length > 0) {
-        lines.push(`Downloaded ${succeeded.length} image(s):`);
-        succeeded.forEach((r) => lines.push(`  ${r.filePath}`));
+      // Search-only mode
+      if (!save_dir) {
+        return {
+          content: [{ type: "text" as const, text: formatSearchResults(selected) }],
+          structuredContent: {
+            results: selected.map(serializeImageResult),
+            diagnostics,
+          },
+        };
       }
-      if (failed.length > 0) {
-        lines.push(`\nFailed ${failed.length} image(s):`);
-        failed.forEach((r) => lines.push(`  ${r.filePath}: ${r.error}`));
-      }
+
+      // Download mode
+      const downloadResult = await downloadImages(results, query, num, save_dir);
+
       return {
-        content: [{ type: "text" as const, text: lines.join("\n") }],
+        content: [{ type: "text" as const, text: formatDownloadResult(downloadResult) }],
         structuredContent: {
-          downloaded: succeeded.map((r) => ({ filePath: r.filePath, width: r.width, height: r.height })),
-          failed: failed.map((r) => ({ filePath: r.filePath, error: r.error ?? "unknown" })),
-          saveDirectory: save_dir ?? "images",
+          directory: downloadResult.directory,
+          downloaded: downloadResult.downloaded.map(serializeDownloadedImage),
+          failed: downloadResult.failed.map(serializeFailedDownload),
+          results: results.map(serializeImageResult),
+          diagnostics,
         },
       };
     } catch (err) {
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Download failed: ${err instanceof Error ? err.message : String(err)}`,
-          },
-        ],
+        content: [{ type: "text" as const, text: `Search failed: ${err instanceof Error ? err.message : String(err)}` }],
         isError: true,
       };
     }
